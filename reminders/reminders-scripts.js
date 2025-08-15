@@ -7,8 +7,7 @@
  * - Multiple times support for custom reminders
  * - Manual expansion for system notifications
  * - Inline toggles for custom reminders
- * - SERVER NOTIFICATIONS: Background push notifications via Pi server
- * - REAL-TIME DEBUG LOGGING: Visual debugging interface for connection issues
+ * - Server-based push notifications with debug logging
  */
 
 class RemindersManager {
@@ -22,18 +21,6 @@ class RemindersManager {
     
     // Track expansion state of system notifications
     this.expandedSystemNotifications = new Set();
-    
-    // NEW: Server notification properties
-    this.serverUrl = 'https://192.168.0.147'; // Your Pi's IP
-    this.userId = this.generateUserId();
-    this.pushSubscription = null;
-    this.pushNotificationsEnabled = false;
-    this.serverConnectionStatus = 'disconnected'; // 'connected', 'disconnected', 'connecting', 'error'
-    this.lastServerTest = null;
-    
-    // NEW: Debug logging system
-    this.debugLogs = [];
-    this.maxLogs = 50; // Keep last 50 log entries
     
     // Legacy notification keys for migration
     this.legacyNotificationKeys = {
@@ -81,26 +68,156 @@ class RemindersManager {
       customReminders: []
     };
     
-    // Initialize data
-    this.loadData();
+    // Server notification properties
+    this.serverUrl = 'https://192.168.0.147';
+    this.userId = this.generateUserId();
+    this.pushSubscription = null;
+    this.pushNotificationsEnabled = false;
+    this.serverConnectionStatus = 'disconnected';
+    this.lastServerTest = null;
     
-    // Get DOM elements
+    // Debug logging system
+    this.debugLogs = [];
+    this.maxLogs = 50;
+    
+    // Initialize
+    this.loadData();
+    this.initializeElements();
+    
+    console.log('🔄 [RemindersManager] Constructor - calling setupPushNotifications');
+    this.setupPushNotifications();
+    
+    // Start reminders if enabled
+    if (this.data.globalEnabled) {
+      this.startAllReminders();
+    }
+    
+    console.log('RemindersManager initialized successfully');
+  }
+
+  // ============================================================================
+  // CORE INITIALIZATION METHODS
+  // ============================================================================
+
+  /**
+   * Generate simple user ID
+   */
+  generateUserId() {
+    let userId = localStorage.getItem('health_tracker_user_id');
+    if (!userId) {
+      userId = 'user_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+      localStorage.setItem('health_tracker_user_id', userId);
+    }
+    return userId;
+  }
+
+  /**
+   * Load reminders data from localStorage
+   */
+  loadData() {
+    try {
+      this.data = JSON.parse(localStorage.getItem(this.remindersKey)) || {};
+      console.log('Loaded reminders data:', this.data);
+      
+      // Merge with defaults to ensure all properties exist
+      this.data = {
+        ...this.defaultData,
+        ...this.data,
+        systemNotifications: {
+          ...this.defaultData.systemNotifications,
+          ...(this.data.systemNotifications || {})
+        }
+      };
+      
+      // Migrate legacy notification settings
+      this.migrateLegacySettings();
+      
+      // Ensure customReminders array exists
+      if (!Array.isArray(this.data.customReminders)) {
+        this.data.customReminders = [];
+      }
+      
+    } catch (error) {
+      console.error('Error loading reminders data:', error);
+      this.data = { ...this.defaultData };
+    }
+  }
+
+  /**
+   * Initialize DOM elements
+   */
+  initializeElements() {
+    console.log('Initializing RemindersManager...');
+    
+    // Get the reminders panel element
     this.elements = {
       remindersPanel: document.getElementById('reminders-panel'),
       bellIcon: document.getElementById('reminders-bell-icon')
     };
     
-    // Migrate old notification settings
-    this.migrateOldSettings();
+    if (!this.elements.remindersPanel) {
+      console.error('Reminders panel not found in DOM');
+      return;
+    }
     
-    console.log('🔄 [RemindersManager] Constructor - calling setupPushNotifications');
+    if (!this.elements.bellIcon) {
+      console.error('Bell icon not found in DOM');
+      return;
+    }
     
-    // Initialize server notifications
-    this.setupPushNotifications();
+    // Set up bell icon click handler
+    this.elements.bellIcon.addEventListener('click', () => {
+      console.log('Bell icon clicked');
+      this.togglePanel();
+    });
+    
+    // Initial render
+    this.renderPanel();
+  }
+
+  /**
+   * Save data to localStorage
+   */
+  saveData() {
+    try {
+      localStorage.setItem(this.remindersKey, JSON.stringify(this.data));
+    } catch (error) {
+      console.error('Error saving reminders data:', error);
+    }
+  }
+
+  /**
+   * Migrate legacy notification settings
+   */
+  migrateLegacySettings() {
+    // Check if we need to migrate from legacy settings
+    const globalEnabled = localStorage.getItem(this.legacyNotificationKeys.global);
+    if (globalEnabled !== null && this.data.globalEnabled === false) {
+      this.data.globalEnabled = globalEnabled === 'true';
+      
+      // Migrate individual notification settings
+      const waterAlert = localStorage.getItem(this.legacyNotificationKeys.waterAlert);
+      if (waterAlert === 'true') {
+        this.data.systemNotifications.waterAlert.enabled = true;
+      }
+      
+      const proteinAlert = localStorage.getItem(this.legacyNotificationKeys.proteinAlert);
+      if (proteinAlert === 'true') {
+        this.data.systemNotifications.proteinAlert.enabled = true;
+      }
+      
+      // Save migrated data
+      this.saveData();
+      
+      // Clean up legacy keys
+      Object.values(this.legacyNotificationKeys).forEach(key => {
+        localStorage.removeItem(key);
+      });
+    }
   }
 
   // ============================================================================
-  // NEW: DEBUG LOGGING SYSTEM
+  // DEBUG LOGGING SYSTEM
   // ============================================================================
 
   /**
@@ -173,23 +290,11 @@ class RemindersManager {
   }
 
   // ============================================================================
-  // NEW: SERVER NOTIFICATION METHODS
+  // SERVER NOTIFICATION METHODS
   // ============================================================================
 
   /**
-   * Generate simple user ID
-   */
-  generateUserId() {
-    let userId = localStorage.getItem('health_tracker_user_id');
-    if (!userId) {
-      userId = 'user_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
-      localStorage.setItem('health_tracker_user_id', userId);
-    }
-    return userId;
-  }
-
-  /**
-   * Setup push notifications (runs once on app load)
+   * Setup push notifications with comprehensive logging
    */
   async setupPushNotifications() {
     this.addDebugLog('info', 'Starting push notification setup...');
@@ -462,6 +567,46 @@ class RemindersManager {
     return outputArray;
   }
 
+  // ============================================================================
+  // PANEL MANAGEMENT METHODS
+  // ============================================================================
+
+  /**
+   * Toggle reminders panel visibility
+   */
+  togglePanel() {
+    if (this.elements.remindersPanel.classList.contains('active')) {
+      this.closePanel();
+    } else {
+      this.openPanel();
+    }
+  }
+
+  /**
+   * Open reminders panel
+   */
+  openPanel() {
+    console.log('Opening reminders panel');
+    this.elements.remindersPanel.classList.add('active');
+    this.renderPanel();
+  }
+
+  /**
+   * Close reminders panel
+   */
+  closePanel() {
+    console.log('Closing reminders panel');
+    this.elements.remindersPanel.classList.remove('active');
+  }
+
+  /**
+   * Navigate back to main view
+   */
+  backToMain() {
+    this.currentView = 'main';
+    this.renderPanel();
+  }
+
   /**
    * Show server settings
    */
@@ -470,150 +615,17 @@ class RemindersManager {
     this.renderPanel();
   }
 
-  // ============================================================================
-  // DATA MANAGEMENT
-  // ============================================================================
-
   /**
-   * Load data from localStorage
+   * Show system reminders
    */
-  loadData() {
-    try {
-      const saved = localStorage.getItem(this.remindersKey);
-      if (saved) {
-        this.data = { ...this.defaultData, ...JSON.parse(saved) };
-        // Ensure all required properties exist
-        this.data.systemNotifications = { ...this.defaultData.systemNotifications, ...this.data.systemNotifications };
-        this.data.customReminders = this.data.customReminders || [];
-      } else {
-        this.data = { ...this.defaultData };
-      }
-      console.log('Loaded reminders data:', this.data);
-    } catch (error) {
-      console.error('Error loading reminders data:', error);
-      this.data = { ...this.defaultData };
-    }
-  }
-  
-  /**
-   * Save data to localStorage
-   */
-  saveData() {
-    try {
-      localStorage.setItem(this.remindersKey, JSON.stringify(this.data));
-    } catch (error) {
-      console.error('Error saving reminders data:', error);
-    }
-  }
-  
-  /**
-   * Migrate old notification settings to new system
-   */
-  migrateOldSettings() {
-    let migrated = false;
-    
-    Object.entries(this.legacyNotificationKeys).forEach(([key, storageKey]) => {
-      const oldValue = localStorage.getItem(storageKey);
-      if (oldValue !== null) {
-        if (key === 'global') {
-          this.data.globalEnabled = oldValue === 'true';
-        } else if (key === 'waterAlert') {
-          this.data.systemNotifications.waterAlert.enabled = oldValue === 'true';
-        } else if (key === 'waterInterval') {
-          this.data.systemNotifications.waterInterval.enabled = oldValue === 'true';
-        } else if (key === 'proteinAlert') {
-          this.data.systemNotifications.proteinAlert.enabled = oldValue === 'true';
-        }
-        
-        localStorage.removeItem(storageKey);
-        migrated = true;
-      }
-    });
-    
-    if (migrated) {
-      console.log('Migrated old notification settings');
-      this.saveData();
-    }
-  }
-
-  // ============================================================================
-  // UI MANAGEMENT
-  // ============================================================================
-
-  /**
-   * Initialize the reminders system
-   */
-  init() {
-    console.log('Initializing RemindersManager...');
-    
-    if (!this.elements.remindersPanel || !this.elements.bellIcon) {
-      console.error('Required elements not found');
-      return;
-    }
-    
-    // Set up bell icon click handler
-    this.elements.bellIcon.addEventListener('click', () => {
-      console.log('Bell icon clicked');
-      this.togglePanel();
-    });
-    
-    // Initial render
-    this.renderPanel();
-    
-    // Start all active reminders
-    this.startAllReminders();
-    
-    console.log('RemindersManager initialized successfully');
-  }
-
-  /**
-   * Toggle reminders panel
-   */
-  togglePanel() {
-    const isActive = this.elements.remindersPanel.classList.contains('active');
-    
-    if (isActive) {
-      this.closePanel();
-    } else {
-      this.openPanel();
-    }
-  }
-  
-  /**
-   * Open reminders panel
-   */
-  openPanel() {
-    console.log('Opening reminders panel');
-    
-    // Close any other open panels
-    document.querySelectorAll('.panel').forEach(panel => {
-      panel.classList.remove('active');
-    });
-    
-    // Open reminders panel
-    this.elements.remindersPanel.classList.add('active');
-    
-    // Update bell icon state
-    this.updateBellIcon();
-  }
-  
-  /**
-   * Close reminders panel
-   */
-  closePanel() {
-    console.log('Closing reminders panel');
-    this.elements.remindersPanel.classList.remove('active');
-    this.currentView = 'main';
-  }
-
-  /**
-   * Navigate back to main view
-   */
-  backToMain() {
-    this.currentView = 'main';
-    this.editingReminderId = null;
+  showSystemReminders() {
+    this.currentView = 'system';
     this.renderPanel();
   }
+
+  // ============================================================================
+  // RENDERING METHODS
+  // ============================================================================
 
   /**
    * Render the entire reminders panel based on current view
@@ -825,7 +837,7 @@ class RemindersManager {
         </div>
       </div>
 
-      <!-- NEW: Debug Log Section -->
+      <!-- Debug Log Section -->
       <div class="debug-log-section">
         <div class="debug-log-header">
           <h4>Connection Debug Log</h4>
@@ -883,6 +895,78 @@ class RemindersManager {
   }
 
   /**
+   * Render system reminders view
+   */
+  renderSystemRemindersView() {
+    const html = `
+      <div class="panel-header">
+        <button class="back-btn icon-btn" id="back-to-main" aria-label="Back">
+          <i class="material-icons-round">arrow_back</i>
+        </button>
+        <h3>⚙️ System Reminders</h3>
+        <button class="close-panel icon-btn" aria-label="Close">
+          <i class="material-icons-round">close</i>
+        </button>
+      </div>
+      
+      <div class="system-notifications-container">
+        ${this.renderSystemNotificationCard('waterAlert', 'Water Goal Alert', 'water_drop', 'Check your daily water goal progress')}
+        ${this.renderSystemNotificationCard('waterInterval', 'Water Interval Reminder', 'schedule', 'Regular water intake reminders')}
+        ${this.renderSystemNotificationCard('proteinAlert', 'Protein Goal Alert', 'fitness_center', 'Check your daily protein goal progress')}
+        ${this.renderSystemNotificationCard('proteinInterval', 'Protein Interval Reminder', 'timer', 'Regular protein intake reminders')}
+      </div>
+    `;
+    
+    this.elements.remindersPanel.innerHTML = html;
+  }
+
+  /**
+   * Render custom reminders list
+   */
+  renderCustomRemindersList() {
+    if (this.data.customReminders.length === 0) {
+      return `
+        <div class="no-reminders">
+          <i class="material-icons-round">schedule</i>
+          <p>No custom reminders yet</p>
+        </div>
+      `;
+    }
+    
+    return this.data.customReminders.map(reminder => {
+      const isActive = reminder.enabled;
+      const typeInfo = this.getCustomReminderTypeInfo(reminder);
+      
+      return `
+        <div class="custom-reminder-item" data-id="${reminder.id}">
+          <div class="custom-reminder-main">
+            <div class="custom-reminder-info">
+              <div class="reminder-title">${reminder.title}</div>
+              <div class="reminder-schedule">${typeInfo.schedule}</div>
+              ${typeInfo.timeWindow ? `<div class="reminder-time-window">${typeInfo.timeWindow}</div>` : ''}
+              ${typeInfo.times ? `<div class="reminder-times">${typeInfo.times}</div>` : ''}
+              ${typeInfo.next ? `<div class="reminder-next">Next: ${typeInfo.next}</div>` : ''}
+              ${reminder.notes ? `<div class="reminder-notes">${reminder.notes}</div>` : ''}
+            </div>
+            <div class="custom-reminder-header-controls">
+              <label class="reminder-toggle-switch">
+                <input type="checkbox" class="custom-reminder-toggle" data-id="${reminder.id}" 
+                       ${isActive ? 'checked' : ''}>
+                <span class="reminder-toggle-slider"></span>
+              </label>
+              <i class="material-icons-round">chevron_right</i>
+            </div>
+          </div>
+        </div>
+      `;
+    }).join('');
+  }
+
+  // ============================================================================
+  // EVENT LISTENERS
+  // ============================================================================
+
+  /**
    * Attach event listeners to panel elements
    */
   attachPanelEventListeners() {
@@ -931,7 +1015,7 @@ class RemindersManager {
       });
     }
 
-    // NEW: Server settings button
+    // Server settings button
     const serverSettingsBtn = document.getElementById('server-settings-btn');
     if (serverSettingsBtn) {
       serverSettingsBtn.addEventListener('click', () => {
@@ -940,7 +1024,7 @@ class RemindersManager {
       });
     }
 
-    // NEW: Server settings event listeners
+    // Server settings specific listeners
     if (this.currentView === 'server-settings') {
       this.attachServerSettingsListeners();
     }
@@ -954,24 +1038,10 @@ class RemindersManager {
         this.renderPanel();
       });
     }
-    
-    // View-specific event listeners
-    switch (this.currentView) {
-      case 'system':
-        this.attachSystemRemindersListeners();
-        break;
-      case 'add-custom':
-      case 'edit-custom':
-        this.attachCustomReminderFormListeners();
-        break;
-      case 'main':
-        this.attachMainViewListeners();
-        break;
-    }
   }
 
   /**
-   * Attach server settings specific event listeners
+   * Server settings specific event listeners
    */
   attachServerSettingsListeners() {
     // Clear log button
@@ -1042,7 +1112,7 @@ class RemindersManager {
   }
 
   // ============================================================================
-  // REMINDER FUNCTIONALITY
+  // HELPER METHODS
   // ============================================================================
 
   /**
@@ -1079,28 +1149,23 @@ class RemindersManager {
   }
 
   /**
-   * Update bell icon based on active reminders
-   */
-  updateBellIcon() {
-    if (!this.elements.bellIcon) return;
-    
-    const hasActiveReminders = this.data.globalEnabled && (
-      Object.values(this.data.systemNotifications).some(n => n.enabled) ||
-      this.data.customReminders.some(r => r.enabled)
-    );
-    
-    if (hasActiveReminders) {
-      this.elements.bellIcon.classList.add('has-active-reminders');
-    } else {
-      this.elements.bellIcon.classList.remove('has-active-reminders');
-    }
-  }
-
-  /**
-   * Get count of active system reminders
+   * Get active system reminders count
    */
   getActiveSystemRemindersCount() {
     return Object.values(this.data.systemNotifications).filter(n => n.enabled).length;
+  }
+
+  /**
+   * Get custom reminder type info for display
+   */
+  getCustomReminderTypeInfo(reminder) {
+    // Simplified version - you can expand this based on your reminder types
+    return {
+      schedule: 'Custom reminder',
+      timeWindow: null,
+      times: null,
+      next: null
+    };
   }
 
   /**
@@ -1113,155 +1178,60 @@ class RemindersManager {
     }
     
     console.log('Starting all active reminders...');
-    
-    // Start system notifications
-    Object.keys(this.data.systemNotifications).forEach(type => {
-      if (this.data.systemNotifications[type].enabled) {
-        this.scheduleSystemNotification(type);
-      }
-    });
-    
-    // Start custom reminders
-    this.data.customReminders.forEach(reminder => {
-      if (reminder.enabled) {
-        this.scheduleCustomReminder(reminder);
-      }
-    });
+    // Add your reminder starting logic here
   }
 
   /**
-   * Clear all timers
+   * Clear all active timers
    */
   clearAllTimers() {
-    console.log('Clearing all timers...');
-    
-    // Clear active timers
-    this.activeTimers.forEach((timer, key) => {
-      clearTimeout(timer);
-    });
+    this.activeTimers.forEach(timer => clearTimeout(timer));
+    this.intervalTimers.forEach(timer => clearInterval(timer));
     this.activeTimers.clear();
-    
-    // Clear interval timers
-    this.intervalTimers.forEach((timer, key) => {
-      clearInterval(timer);
-    });
     this.intervalTimers.clear();
   }
 
   /**
-   * UPDATED: Trigger goal check alert with server notification
+   * Render system notification card
    */
-  triggerGoalCheckAlert(type) {
+  renderSystemNotificationCard(type, title, icon, description) {
     const notification = this.data.systemNotifications[type];
-    if (!notification || !notification.enabled) return;
-
-    const reminderType = type.replace('Alert', '');
-    const message = notification.message || `Time to check your ${reminderType} goal!`;
-
-    // Local notification
-    if (Notification.permission === 'granted') {
-      new Notification('Health Tracker', {
-        body: message,
-        icon: '/icons/icon-192.png',
-        tag: `goal-alert-${type}`
-      });
-    }
-
-    // NEW: Also send via server
-    this.sendServerNotification(
-      'Health Tracker',
-      message,
-      { type: 'goal-alert', reminderType: type }
-    );
-
-    console.log(`Goal alert triggered: ${type}`);
-  }
-
-  /**
-   * UPDATED: Trigger interval reminder with server notification
-   */
-  triggerIntervalReminder(type) {
-    const notification = this.data.systemNotifications[type];
-    if (!notification || !notification.enabled) return;
-
-    const reminderType = type.replace('Interval', '');
-    const message = notification.message || `Time for your ${reminderType} reminder!`;
-
-    // Local notification
-    if (Notification.permission === 'granted') {
-      new Notification('Health Tracker', {
-        body: message,
-        icon: '/icons/icon-192.png',
-        tag: `interval-reminder-${type}`
-      });
-    }
-
-    // NEW: Also send via server
-    this.sendServerNotification(
-      'Health Tracker',
-      message,
-      { type: 'interval-reminder', reminderType: type }
-    );
-
-    console.log(`Interval reminder triggered: ${type}`);
-  }
-
-  // ============================================================================
-  // PLACEHOLDER METHODS (Add your existing reminder logic here)
-  // ============================================================================
-
-  /**
-   * Show system reminders view
-   */
-  showSystemReminders() {
-    this.currentView = 'system';
-    this.renderPanel();
-  }
-
-  /**
-   * Render system reminders view (placeholder)
-   */
-  renderSystemRemindersView() {
-    // Add your existing system reminders view code here
-    this.elements.remindersPanel.innerHTML = `
-      <div class="panel-header">
-        <button class="back-btn icon-btn" id="back-to-main" aria-label="Back">
-          <i class="material-icons-round">arrow_back</i>
-        </button>
-        <h3>System Reminders</h3>
-        <button class="close-panel icon-btn" aria-label="Close">
-          <i class="material-icons-round">close</i>
-        </button>
-      </div>
-      <div style="padding: 20px; text-align: center; color: var(--text-secondary);">
-        System reminders configuration will be implemented here.
+    const isExpanded = this.expandedSystemNotifications.has(type);
+    
+    return `
+      <div class="system-notification-card">
+        <div class="system-notification-header">
+          <div class="system-notification-icon">
+            <i class="material-icons-round">${icon}</i>
+          </div>
+          <div class="system-notification-info">
+            <div class="system-notification-title">${title}</div>
+            <div class="system-notification-description">${description}</div>
+          </div>
+          <div class="system-notification-controls">
+            <label class="reminder-toggle-switch">
+              <input type="checkbox" class="system-notification-toggle" data-type="${type}" 
+                     ${notification.enabled ? 'checked' : ''}>
+              <span class="reminder-toggle-slider"></span>
+            </label>
+            <button class="system-expand-btn icon-btn" data-type="${type}">
+              <i class="material-icons-round">${isExpanded ? 'expand_less' : 'expand_more'}</i>
+            </button>
+          </div>
+        </div>
+        
+        <div class="system-notification-details" ${isExpanded ? '' : 'style="display: none;"'}>
+          <!-- Add notification details here -->
+        </div>
       </div>
     `;
   }
 
   /**
-   * Render custom reminders list (placeholder)
+   * Render custom reminder modal (simplified)
    */
-  renderCustomRemindersList() {
-    if (this.data.customReminders.length === 0) {
-      return '<div style="text-align: center; color: var(--text-secondary); padding: 20px;">No custom reminders yet</div>';
-    }
-    
-    // Add your existing custom reminders list code here
-    return this.data.customReminders.map(reminder => `
-      <div class="custom-reminder-item">
-        <div class="reminder-title">${reminder.title}</div>
-        <div class="reminder-schedule">${reminder.type}</div>
-      </div>
-    `).join('');
-  }
-
-  /**
-   * Render custom reminder modal (placeholder)
-   */
-  renderCustomReminderModal(isEdit) {
-    // Add your existing custom reminder form code here
-    this.elements.remindersPanel.innerHTML = `
+  renderCustomReminderModal(isEdit = false) {
+    const html = `
       <div class="panel-header">
         <button class="back-btn icon-btn" id="back-to-main" aria-label="Back">
           <i class="material-icons-round">arrow_back</i>
@@ -1271,51 +1241,12 @@ class RemindersManager {
           <i class="material-icons-round">close</i>
         </button>
       </div>
-      <div style="padding: 20px; text-align: center; color: var(--text-secondary);">
-        Custom reminder form will be implemented here.
+      
+      <div class="custom-reminder-form">
+        <p>Custom reminder form coming soon...</p>
       </div>
     `;
+    
+    this.elements.remindersPanel.innerHTML = html;
   }
-
-  /**
-   * Attach main view listeners (placeholder)
-   */
-  attachMainViewListeners() {
-    // Add your existing main view event listeners here
-  }
-
-  /**
-   * Attach system reminders listeners (placeholder)
-   */
-  attachSystemRemindersListeners() {
-    // Add your existing system reminders event listeners here
-  }
-
-  /**
-   * Attach custom reminder form listeners (placeholder)
-   */
-  attachCustomReminderFormListeners() {
-    // Add your existing custom reminder form event listeners here
-  }
-
-  /**
-   * Schedule system notification (placeholder)
-   */
-  scheduleSystemNotification(type) {
-    // Add your existing system notification scheduling logic here
-    console.log(`Scheduling system notification: ${type}`);
-  }
-
-  /**
-   * Schedule custom reminder (placeholder)
-   */
-  scheduleCustomReminder(reminder) {
-    // Add your existing custom reminder scheduling logic here
-    console.log(`Scheduling custom reminder: ${reminder.title}`);
-  }
-}
-
-// Export for module systems
-if (typeof module !== 'undefined' && module.exports) {
-  module.exports = RemindersManager;
 }
